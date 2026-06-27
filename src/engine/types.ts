@@ -37,8 +37,15 @@ export interface CompressJob {
   inputPath: string;
   outputPath: string;
   settings: CompressionSettings;
-  /** From probe(), used to compute progress %. */
+  /**
+   * Duration to encode, in seconds — used to compute progress %. When trimming,
+   * this is the trimmed length (trimEnd − trimStart), not the source length.
+   */
   durationSec: number;
+  /** Trim in-point (seconds). null = start from the beginning. */
+  trimStart?: number | null;
+  /** Trim out-point (seconds). null = run to the end. */
+  trimEnd?: number | null;
 }
 
 export interface Progress {

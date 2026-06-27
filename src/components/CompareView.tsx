@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import type { VideoInfo } from "../engine/types";
 import { formatBytes, formatDuration } from "../lib/format";
+import { useSyncedPlayback } from "../hooks/useSyncedPlayback";
 
 interface Props {
   originalPath: string;
@@ -29,10 +30,7 @@ interface Props {
   onDiscard: () => void;
 }
 
-type Mode = "side" | "slider";
-
-// Keep the compressed video locked to the original's playhead.
-const DRIFT_TOLERANCE = 0.18; // seconds
+type Layout = "side" | "slider";
 
 export function CompareView({
   originalPath,
@@ -46,16 +44,11 @@ export function CompareView({
   onReveal,
   onDiscard,
 }: Props) {
-  const origRef = useRef<HTMLVideoElement>(null);
-  const compRef = useRef<HTMLVideoElement>(null);
-  const trackRef = useRef<HTMLDivElement>(null);
+  const player = useSyncedPlayback(originalInfo.durationSec || 0);
+  const { originalRef, compressedRef, originalVideoHandlers } = player;
 
-  const [mode, setMode] = useState<Mode>("side");
-  const [playing, setPlaying] = useState(false);
-  const [muted, setMuted] = useState(true);
-  const [duration, setDuration] = useState(originalInfo.durationSec || 0);
-  const [current, setCurrent] = useState(0);
-  const [scrubbing, setScrubbing] = useState(false);
+  const trackRef = useRef<HTMLDivElement>(null);
+  const [layout, setLayout] = useState<Layout>("side");
   const [split, setSplit] = useState(50); // % position of the slider divider
 
   const origSrc = convertFileSrc(originalPath);
@@ -63,105 +56,19 @@ export function CompareView({
 
   const pctSaved =
     compressedInfo && originalInfo.sizeBytes > 0
-      ? Math.round(((originalInfo.sizeBytes - compressedInfo.sizeBytes) / originalInfo.sizeBytes) * 100)
+      ? Math.round(
+          ((originalInfo.sizeBytes - compressedInfo.sizeBytes) /
+            originalInfo.sizeBytes) *
+            100,
+        )
       : 0;
 
-  const syncCompressed = useCallback((force = false) => {
-    const o = origRef.current;
-    const c = compRef.current;
-    if (!o || !c) return;
-    if (force || Math.abs(c.currentTime - o.currentTime) > DRIFT_TOLERANCE) {
-      c.currentTime = o.currentTime;
-    }
-  }, []);
-
-  const togglePlay = useCallback(() => {
-    const o = origRef.current;
-    const c = compRef.current;
-    if (!o || !c) return;
-    if (o.paused) {
-      syncCompressed(true);
-      void o.play();
-      void c.play();
-      setPlaying(true);
-    } else {
-      o.pause();
-      c.pause();
-      setPlaying(false);
-    }
-  }, [syncCompressed]);
-
-  const seekTo = useCallback((t: number) => {
-    const o = origRef.current;
-    const c = compRef.current;
-    if (!o || !c) return;
-    o.currentTime = t;
-    c.currentTime = t;
-    setCurrent(t);
-  }, []);
-
-  // Media-event handlers bound directly on the <video> in JSX, so they work in
-  // both view modes (the element remounts when the mode switches).
-  const handleMeta = useCallback(
-    (e: React.SyntheticEvent<HTMLVideoElement>) =>
-      setDuration(e.currentTarget.duration || originalInfo.durationSec || 0),
-    [originalInfo.durationSec]
-  );
-  const handleTime = useCallback(
-    (e: React.SyntheticEvent<HTMLVideoElement>) => {
-      if (!scrubbing) setCurrent(e.currentTarget.currentTime);
-      syncCompressed();
-    },
-    [scrubbing, syncCompressed]
-  );
-  const handleEnded = useCallback(() => {
-    setPlaying(false);
-    origRef.current?.pause();
-    compRef.current?.pause();
-  }, []);
-
-  // Drive the playhead with requestAnimationFrame while playing — reliable and
-  // smooth (timeupdate alone can be sparse or stall with streamed sources).
+  // A layout switch remounts the <video> elements — restore position & playback.
   useEffect(() => {
-    if (!playing) return;
-    let raf = 0;
-    const tick = () => {
-      const o = origRef.current;
-      if (o && !scrubbing) setCurrent(o.currentTime);
-      syncCompressed();
-      raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [playing, scrubbing, syncCompressed]);
-
-  // A mode switch remounts the <video> elements — restore position & playback.
-  useEffect(() => {
-    const o = origRef.current;
-    const c = compRef.current;
-    if (!o || !c) return;
-    o.currentTime = current;
-    c.currentTime = current;
-    if (playing) {
-      void o.play();
-      void c.play();
-    }
+    player.restoreAfterRemount();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode]);
+  }, [layout]);
 
-  // Keyboard: space = play/pause.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.code === "Space") {
-        e.preventDefault();
-        togglePlay();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay]);
-
-  // Slider drag (split mode).
   const handleSplitPointer = useCallback((clientX: number) => {
     const el = trackRef.current;
     if (!el) return;
@@ -188,19 +95,24 @@ export function CompareView({
         )}
       </div>
 
-      {/* Mode toggle */}
+      {/* Layout toggle */}
       <div className="flex gap-2">
-        <ModeButton active={mode === "side"} onClick={() => setMode("side")} icon={Columns2} label="Side by side" />
         <ModeButton
-          active={mode === "slider"}
-          onClick={() => setMode("slider")}
+          active={layout === "side"}
+          onClick={() => setLayout("side")}
+          icon={Columns2}
+          label="Side by side"
+        />
+        <ModeButton
+          active={layout === "slider"}
+          onClick={() => setLayout("slider")}
           icon={SquareSplitHorizontal}
           label="Split slider"
         />
       </div>
 
       {/* Players */}
-      {mode === "side" ? (
+      {layout === "side" ? (
         <div className="grid grid-cols-2 gap-3">
           <Panel
             label="Original"
@@ -209,14 +121,12 @@ export function CompareView({
             tone="neutral"
           >
             <video
-              ref={origRef}
+              ref={originalRef}
               src={origSrc}
-              muted={muted}
+              muted={player.muted}
               playsInline
               preload="auto"
-              onLoadedMetadata={handleMeta}
-              onTimeUpdate={handleTime}
-              onEnded={handleEnded}
+              {...originalVideoHandlers}
               className="h-full w-full object-contain"
             />
           </Panel>
@@ -226,7 +136,13 @@ export function CompareView({
             sub={compressedInfo ? `${compressedInfo.width}×${compressedInfo.height}` : ""}
             tone="good"
           >
-            <video ref={compRef} src={compSrc} muted playsInline className="h-full w-full object-contain" />
+            <video
+              ref={compressedRef}
+              src={compSrc}
+              muted
+              playsInline
+              className="h-full w-full object-contain"
+            />
           </Panel>
         </div>
       ) : (
@@ -243,19 +159,23 @@ export function CompareView({
         >
           {/* Base: original (right side shows through) */}
           <video
-            ref={origRef}
+            ref={originalRef}
             src={origSrc}
-            muted={muted}
+            muted={player.muted}
             playsInline
             preload="auto"
-            onLoadedMetadata={handleMeta}
-            onTimeUpdate={handleTime}
-            onEnded={handleEnded}
+            {...originalVideoHandlers}
             className="absolute inset-0 h-full w-full object-contain"
           />
           {/* Overlay: compressed, clipped to the left of the divider */}
           <div className="absolute inset-0" style={{ clipPath: `inset(0 ${100 - split}% 0 0)` }}>
-            <video ref={compRef} src={compSrc} muted playsInline className="h-full w-full object-contain" />
+            <video
+              ref={compressedRef}
+              src={compSrc}
+              muted
+              playsInline
+              className="h-full w-full object-contain"
+            />
           </div>
           {/* Divider */}
           <div className="pointer-events-none absolute inset-y-0 z-10 w-0.5 bg-white/90" style={{ left: `${split}%` }}>
@@ -276,30 +196,34 @@ export function CompareView({
       {/* Transport */}
       <div className="flex items-center gap-3 rounded-xl border border-ink-700 bg-ink-900/60 px-4 py-3">
         <button
-          onClick={togglePlay}
+          onClick={player.togglePlay}
           className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-accent text-white hover:bg-accent-bright"
         >
-          {playing ? <Pause className="h-5 w-5" /> : <Play className="h-5 w-5 translate-x-0.5" />}
+          {player.playing ? <Pause className="h-5 w-5" /> : <Play className="h-5 w-5 translate-x-0.5" />}
         </button>
-        <span className="shrink-0 text-xs tabular-nums text-zinc-400">{formatDuration(current)}</span>
+        <span className="shrink-0 text-xs tabular-nums text-zinc-400">
+          {formatDuration(player.current)}
+        </span>
         <input
           type="range"
           min={0}
-          max={duration || 0}
+          max={player.duration || 0}
           step={0.05}
-          value={current}
-          onMouseDown={() => setScrubbing(true)}
-          onMouseUp={() => setScrubbing(false)}
-          onChange={(e) => seekTo(Number(e.target.value))}
+          value={player.current}
+          onMouseDown={player.beginScrub}
+          onMouseUp={player.endScrub}
+          onChange={(e) => player.seek(Number(e.target.value))}
           className="h-1.5 flex-1 accent-indigo-400"
         />
-        <span className="shrink-0 text-xs tabular-nums text-zinc-400">{formatDuration(duration)}</span>
+        <span className="shrink-0 text-xs tabular-nums text-zinc-400">
+          {formatDuration(player.duration)}
+        </span>
         <button
-          onClick={() => setMuted((m) => !m)}
-          title={muted ? "Unmute original audio" : "Mute"}
+          onClick={player.toggleMute}
+          title={player.muted ? "Unmute original audio" : "Mute"}
           className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-ink-700 bg-ink-800 text-zinc-300 hover:text-white"
         >
-          {muted ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
+          {player.muted ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
         </button>
       </div>
 

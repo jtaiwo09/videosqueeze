@@ -6,6 +6,8 @@ interface Props {
   compressedBytes: number;
   savedPath: string | null;
   saving: boolean;
+  /** Compare relies on matching timelines — hidden when the output was trimmed. */
+  canCompare?: boolean;
   onCompare: () => void;
   onSave: () => void;
   onReveal: () => void;
@@ -18,6 +20,7 @@ export function ResultSummary({
   compressedBytes,
   savedPath,
   saving,
+  canCompare = true,
   onCompare,
   onSave,
   onReveal,
@@ -53,14 +56,16 @@ export function ResultSummary({
         </div>
       </div>
 
-      {/* Review before saving */}
-      <button
-        onClick={onCompare}
-        className="flex w-full items-center justify-center gap-2 rounded-xl border border-ink-600 bg-ink-800 py-2.5 text-sm font-medium text-zinc-200 transition-colors hover:border-accent hover:text-white"
-      >
-        <GitCompare className="h-4 w-4" />
-        Compare original vs compressed
-      </button>
+      {/* Review before saving (compare needs matching timelines, so not for trims) */}
+      {canCompare && (
+        <button
+          onClick={onCompare}
+          className="flex w-full items-center justify-center gap-2 rounded-xl border border-ink-600 bg-ink-800 py-2.5 text-sm font-medium text-zinc-200 transition-colors hover:border-accent hover:text-white"
+        >
+          <GitCompare className="h-4 w-4" />
+          Compare original vs compressed
+        </button>
+      )}
 
       {savedPath ? (
         <div className="space-y-2">

@@ -27,15 +27,27 @@ React UI  ──▶  CompressionEngine (interface)
 
 ### Quality presets
 
-| Preset  | Encoder            | Result                                            |
-|---------|--------------------|---------------------------------------------------|
-| High    | Hardware H.264     | Near-original quality, big savings on recordings  |
-| Medium  | Hardware H.264     | Balanced — good default                           |
-| Low     | Hardware H.264     | Smallest, downscaled to 1080p                     |
-| Custom  | Your choice        | H.264/H.265 · hardware/software · quality · resolution |
+| Preset      | Encoder            | Result                                            |
+|-------------|--------------------|---------------------------------------------------|
+| High        | Hardware H.264     | Near-original quality, big savings on recordings  |
+| Medium      | Hardware H.264     | Balanced — good default                           |
+| Low         | Hardware H.264     | Smallest, downscaled to 1080p                     |
+| Target size | Your choice        | Pick a size (e.g. 25 MB) — bitrate is solved to fit |
+| Custom      | Your choice        | H.264/H.265 · hardware/software · quality · resolution |
 
 - **Hardware** (VideoToolbox) is the fast path — several times faster than real-time on Apple Silicon.
 - **Software** (libx264 / libx265) packs files a little smaller at the cost of speed.
+
+### Target size
+
+Instead of choosing a quality, you name an output size and VideoSqueeze solves for
+the video bitrate that lands there: `size ≈ (videoKbps + audioKbps) × duration`,
+inverted. Quick-pick chips cover 10 / 25 / 50 / 100 / 250 MB, or type any number.
+It aims a touch under the target so the encoder's overshoot still fits, and warns
+you up front when a size is unreachable at watchable quality (suggesting a lower
+resolution) or is already larger than the source. For the most precise size,
+switch the encoder to **Software** — VideoToolbox doesn't honor a bitrate target
+exactly.
 
 ---
 

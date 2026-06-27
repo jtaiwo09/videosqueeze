@@ -1,6 +1,6 @@
-import type { CompressionSettings, CodecId, EncoderMode } from "./types";
+import type { CompressionSettings, CodecId, EncoderMode, VideoInfo } from "./types";
 
-export type PresetId = "high" | "medium" | "low" | "custom";
+export type PresetId = "high" | "medium" | "low" | "custom" | "target";
 
 /** Don't let the target drop below this — avoids unwatchable output. */
 const FLOOR_KBPS = 200;
@@ -17,7 +17,7 @@ export interface Preset {
   audioKbps: number;
 }
 
-export const PRESETS: Record<Exclude<PresetId, "custom">, Preset> = {
+export const PRESETS: Record<Exclude<PresetId, "custom" | "target">, Preset> = {
   high: {
     id: "high",
     label: "High",
@@ -110,4 +110,103 @@ export function settingsFromCustom(c: CustomConfig, sourceTotalKbps: number): Co
 /** Accurate size estimate: bitrate × duration. */
 export function estimateBytes(s: CompressionSettings, durationSec: number): number {
   return Math.max(1, Math.round(((s.videoBitrateKbps + s.audioKbps) * 1000 / 8) * durationSec));
+}
+
+/** Bytes equivalent of a target-size selection (MiB, matching how sizes display). */
+export function targetBytesOf(target: TargetConfig): number {
+  return Math.round(target.targetMB * 1024 * 1024);
+}
+
+/** In target mode, is a source of `sizeBytes` already at or under the target? */
+export function isUnderTargetSize(
+  presetId: PresetId,
+  target: TargetConfig,
+  sizeBytes: number,
+): boolean {
+  return presetId === "target" && sizeBytes <= targetBytesOf(target);
+}
+
+/** Source total bitrate (kbps): prefer the probed value, fall back to size/duration. */
+export function sourceKbpsOf(info: VideoInfo): number {
+  return (
+    info.bitrateKbps ||
+    Math.round((info.sizeBytes * 8) / Math.max(1, info.durationSec) / 1000)
+  );
+}
+
+/**
+ * Resolve the active preset/custom/target selection into concrete settings for a
+ * given source. `durationSec` matters only for target-size mode (it's how the
+ * bitrate is solved) — pass the trimmed duration when trimming.
+ */
+export function deriveSettings(
+  presetId: PresetId,
+  custom: CustomConfig,
+  target: TargetConfig,
+  sourceTotalKbps: number,
+  durationSec: number,
+): CompressionSettings {
+  if (presetId === "custom") return settingsFromCustom(custom, sourceTotalKbps);
+  if (presetId === "target") return settingsFromTarget(target, durationSec, sourceTotalKbps);
+  return settingsFromPreset(PRESETS[presetId], sourceTotalKbps);
+}
+
+// ---------- Target-file-size mode ----------
+// Instead of picking a quality, the user picks a size and we solve for the video
+// bitrate that hits it: estimateBytes() inverted.
+
+/** Audio budget reserved in target-size mode. */
+const TARGET_AUDIO_KBPS = 128;
+/**
+ * Aim slightly under the requested size so the encoder's natural overshoot
+ * (VideoToolbox in particular doesn't honor -b:v exactly) still lands at/under it.
+ */
+const TARGET_SAFETY = 0.95;
+
+export interface TargetConfig {
+  /** Desired output size, in MB (MiB — matches how sizes are displayed). */
+  targetMB: number;
+  codec: CodecId;
+  mode: EncoderMode;
+  scaleHeight: number | null;
+}
+
+export const DEFAULT_TARGET: TargetConfig = {
+  targetMB: 25,
+  codec: "h264",
+  mode: "hardware",
+  scaleHeight: null,
+};
+
+/** Quick-pick sizes (MB) shown as chips in the target panel. */
+export const TARGET_SIZE_OPTIONS = [10, 25, 50, 100, 250];
+
+/**
+ * Solve for the video bitrate that lands at `targetMB` over `durationSec`:
+ *   targetBits ≈ (videoKbps + audioKbps) × 1000 × durationSec
+ * Clamped so we never inflate above the source bitrate (pointless) or drop below
+ * the watchable floor (when the target is smaller than is achievable).
+ */
+export function settingsFromTarget(
+  c: TargetConfig,
+  durationSec: number,
+  sourceTotalKbps: number,
+): CompressionSettings {
+  const audioKbps = TARGET_AUDIO_KBPS;
+  const targetBits = c.targetMB * 1024 * 1024 * 8 * TARGET_SAFETY;
+  const totalKbps = durationSec > 0 ? targetBits / durationSec / 1000 : 0;
+  const sourceVideo = Math.max(FLOOR_KBPS, Math.round(sourceTotalKbps * 0.95));
+
+  let videoKbps = Math.round(totalKbps - audioKbps);
+  videoKbps = Math.min(videoKbps, sourceVideo); // never inflate above the source
+  videoKbps = Math.max(FLOOR_KBPS, videoKbps); // keep it watchable
+
+  return {
+    codec: c.codec,
+    mode: c.mode,
+    videoBitrateKbps: videoKbps,
+    scaleHeight: c.scaleHeight,
+    fps: null,
+    audioKbps,
+  };
 }

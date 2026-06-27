@@ -42,6 +42,10 @@ struct CompressJob {
     output_path: String,
     settings: CompressionSettings,
     duration_sec: f64,
+    #[serde(default)]
+    trim_start: Option<f64>,
+    #[serde(default)]
+    trim_end: Option<f64>,
 }
 
 #[derive(Serialize, Clone)]
@@ -84,14 +88,30 @@ fn parse_timecode(s: &str) -> f64 {
     }
 }
 
-/// Build the FFmpeg argument list from a job.
-fn build_ffmpeg_args(job: &CompressJob) -> Vec<String> {
+/// Which encoding pass a set of args is for. Software encodes run two passes
+/// (analyze, then encode) to hit the target bitrate precisely; hardware runs once.
+#[derive(Clone, Copy, PartialEq)]
+enum Pass {
+    Single,
+    First,
+    Second,
+}
+
+/// Build the FFmpeg argument list from a job for a given pass.
+fn build_ffmpeg_args(job: &CompressJob, pass: Pass, passlog: &str) -> Vec<String> {
     let s = &job.settings;
-    let mut args: Vec<String> = vec![
-        "-y".into(),
-        "-i".into(),
-        job.input_path.clone(),
-    ];
+    let mut args: Vec<String> = vec!["-y".into()];
+
+    // Trim in-point: seek BEFORE -i (fast, and accurate when re-encoding).
+    if let Some(start) = job.trim_start {
+        if start > 0.0 {
+            args.push("-ss".into());
+            args.push(format!("{:.3}", start));
+        }
+    }
+
+    args.push("-i".into());
+    args.push(job.input_path.clone());
 
     // Video filters: optional downscale + fps cap.
     let mut filters: Vec<String> = Vec::new();
@@ -154,19 +174,54 @@ fn build_ffmpeg_args(job: &CompressJob) -> Vec<String> {
         }
     }
 
-    // Audio.
-    args.extend([
-        "-c:a".into(), "aac".into(),
-        "-b:a".into(), format!("{}k", s.audio_kbps),
-    ]);
+    // Two-pass bookkeeping (software only). Pass 1 analyzes; pass 2 encodes.
+    match pass {
+        Pass::First => {
+            args.extend(["-pass".into(), "1".into(), "-passlogfile".into(), passlog.into()]);
+        }
+        Pass::Second => {
+            args.extend(["-pass".into(), "2".into(), "-passlogfile".into(), passlog.into()]);
+        }
+        Pass::Single => {}
+    }
 
-    // Fast-start for streaming/preview + machine-readable progress on stdout.
-    args.extend([
-        "-movflags".into(), "+faststart".into(),
-        "-progress".into(), "pipe:1".into(),
-        "-nostats".into(),
-        job.output_path.clone(),
-    ]);
+    // Audio: skipped on the analysis pass; encoded otherwise.
+    if pass == Pass::First {
+        args.push("-an".into());
+    } else {
+        args.extend([
+            "-c:a".into(), "aac".into(),
+            "-b:a".into(), format!("{}k", s.audio_kbps),
+        ]);
+    }
+
+    // Trim out-point: limit the encoded duration (measured from the seek point).
+    if let (Some(start), Some(end)) = (job.trim_start, job.trim_end) {
+        let dur = (end - start).max(0.0);
+        if dur > 0.0 {
+            args.push("-t".into());
+            args.push(format!("{:.3}", dur));
+        }
+    } else if let Some(end) = job.trim_end {
+        // Out-point only (no in-point): -t equals the out-point.
+        if end > 0.0 {
+            args.push("-t".into());
+            args.push(format!("{:.3}", end));
+        }
+    }
+
+    // Machine-readable progress on stdout.
+    args.extend(["-progress".into(), "pipe:1".into(), "-nostats".into()]);
+
+    // Output: pass 1 is discarded (null muxer); real passes write the file.
+    if pass == Pass::First {
+        args.extend(["-f".into(), "null".into(), "/dev/null".into()]);
+    } else {
+        args.extend([
+            "-movflags".into(), "+faststart".into(),
+            job.output_path.clone(),
+        ]);
+    }
 
     args
 }
@@ -256,16 +311,29 @@ async fn probe_video(app: AppHandle, path: String) -> Result<VideoInfo, String> 
     })
 }
 
-#[tauri::command]
-async fn compress_video(
-    app: AppHandle,
-    job: CompressJob,
-    on_progress: Channel<ProgressPayload>,
-    state: State<'_, AppState>,
-) -> Result<CompressResult, String> {
-    state.cancelled.store(false, Ordering::SeqCst);
+/// Remove the stats files ffmpeg writes during a two-pass run.
+fn cleanup_passlog(base: &str) {
+    let _ = std::fs::remove_file(format!("{base}-0.log"));
+    let _ = std::fs::remove_file(format!("{base}-0.log.mbtree"));
+}
 
-    let args = build_ffmpeg_args(&job);
+/// Run one ffmpeg invocation, mapping its progress into the
+/// `[ratio_base, ratio_base + ratio_span]` slice of the overall job. `future_secs`
+/// is the encode time still to come after this pass (for a smooth cross-pass ETA).
+/// Returns the process exit code.
+#[allow(clippy::too_many_arguments)]
+async fn run_pass(
+    app: &AppHandle,
+    args: Vec<String>,
+    state: &State<'_, AppState>,
+    duration_sec: f64,
+    ratio_base: f64,
+    ratio_span: f64,
+    future_secs: f64,
+    report_size: bool,
+    on_progress: &Channel<ProgressPayload>,
+    stderr_tail: &mut Vec<String>,
+) -> Result<Option<i32>, String> {
     let (mut rx, child) = app
         .shell()
         .sidecar("ffmpeg")
@@ -281,7 +349,6 @@ async fn compress_video(
     let mut cur_speed = 0.0f64;
     let mut cur_fps = 0.0f64;
     let mut cur_size = 0u64;
-    let mut stderr_tail: Vec<String> = Vec::new();
     let mut exit_code: Option<i32> = None;
 
     while let Some(event) = rx.recv().await {
@@ -300,13 +367,15 @@ async fn compress_video(
                             "fps" => cur_fps = v.trim().parse().unwrap_or(cur_fps),
                             "total_size" => cur_size = v.trim().parse().unwrap_or(cur_size),
                             "progress" => {
-                                let ratio = if job.duration_sec > 0.0 {
-                                    (cur_out_time / job.duration_sec).clamp(0.0, 1.0)
+                                let pass_ratio = if duration_sec > 0.0 {
+                                    (cur_out_time / duration_sec).clamp(0.0, 1.0)
                                 } else {
                                     0.0
                                 };
-                                let eta_sec = if cur_speed > 0.0 && job.duration_sec > 0.0 {
-                                    Some(((job.duration_sec - cur_out_time).max(0.0)) / cur_speed)
+                                let ratio = (ratio_base + pass_ratio * ratio_span).clamp(0.0, 1.0);
+                                let eta_sec = if cur_speed > 0.0 && duration_sec > 0.0 {
+                                    let remaining = (duration_sec - cur_out_time).max(0.0) + future_secs;
+                                    Some(remaining / cur_speed)
                                 } else {
                                     None
                                 };
@@ -314,7 +383,7 @@ async fn compress_video(
                                     ratio,
                                     fps: cur_fps,
                                     speed: cur_speed,
-                                    out_bytes: cur_size,
+                                    out_bytes: if report_size { cur_size } else { 0 },
                                     eta_sec,
                                 });
                             }
@@ -346,6 +415,89 @@ async fn compress_video(
 
     // Clear any stored child (it may already be gone after a cancel).
     *state.child.lock().unwrap() = None;
+    Ok(exit_code)
+}
+
+#[tauri::command]
+async fn compress_video(
+    app: AppHandle,
+    job: CompressJob,
+    on_progress: Channel<ProgressPayload>,
+    state: State<'_, AppState>,
+) -> Result<CompressResult, String> {
+    state.cancelled.store(false, Ordering::SeqCst);
+
+    let mut stderr_tail: Vec<String> = Vec::new();
+    let dur = job.duration_sec;
+
+    // Software encodes run two passes (analyze, then encode) so the output hits
+    // the target bitrate precisely. Hardware (VideoToolbox) can't two-pass.
+    let two_pass = job.settings.mode == "software";
+
+    let exit_code = if two_pass {
+        let passlog = format!("{}.passlog", job.output_path);
+
+        // Pass 1: analyze — first half of the progress bar.
+        let code1 = run_pass(
+            &app,
+            build_ffmpeg_args(&job, Pass::First, &passlog),
+            &state,
+            dur,
+            0.0,
+            0.5,
+            dur,
+            false,
+            &on_progress,
+            &mut stderr_tail,
+        )
+        .await?;
+
+        if state.cancelled.load(Ordering::SeqCst) {
+            cleanup_passlog(&passlog);
+            let _ = std::fs::remove_file(&job.output_path);
+            return Err("Canceled".to_string());
+        }
+        if code1 != Some(0) {
+            cleanup_passlog(&passlog);
+            return Err(format!(
+                "Compression failed (analysis pass, exit {:?}).\n{}",
+                code1,
+                stderr_tail.join("\n")
+            ));
+        }
+
+        // Pass 2: encode — second half of the progress bar.
+        let code2 = run_pass(
+            &app,
+            build_ffmpeg_args(&job, Pass::Second, &passlog),
+            &state,
+            dur,
+            0.5,
+            0.5,
+            0.0,
+            true,
+            &on_progress,
+            &mut stderr_tail,
+        )
+        .await?;
+
+        cleanup_passlog(&passlog);
+        code2
+    } else {
+        run_pass(
+            &app,
+            build_ffmpeg_args(&job, Pass::Single, ""),
+            &state,
+            dur,
+            0.0,
+            1.0,
+            0.0,
+            true,
+            &on_progress,
+            &mut stderr_tail,
+        )
+        .await?
+    };
 
     if state.cancelled.load(Ordering::SeqCst) {
         // Best-effort cleanup of the partial output file.
@@ -355,8 +507,11 @@ async fn compress_video(
 
     if exit_code != Some(0) {
         let _ = std::fs::remove_file(&job.output_path);
-        let tail = stderr_tail.join("\n");
-        return Err(format!("Compression failed (exit {:?}).\n{}", exit_code, tail));
+        return Err(format!(
+            "Compression failed (exit {:?}).\n{}",
+            exit_code,
+            stderr_tail.join("\n")
+        ));
     }
 
     let output_bytes = std::fs::metadata(&job.output_path)
@@ -391,6 +546,11 @@ fn copy_file(src: String, dest: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn file_exists(path: String) -> bool {
+    std::path::Path::new(&path).exists()
+}
+
+#[tauri::command]
 fn reveal_in_finder(path: String) -> Result<(), String> {
     std::process::Command::new("open")
         .args(["-R", &path])
@@ -410,7 +570,8 @@ fn main() {
             cancel_compression,
             reveal_in_finder,
             delete_file,
-            copy_file
+            copy_file,
+            file_exists
         ])
         .run(tauri::generate_context!())
         .expect("error while running VideoSqueeze");
